@@ -234,4 +234,237 @@ def ffib_parse_jornada(url: str) -> List[FFIBItem]:
     # Deduplicate items by (date + links + flags)
     uniq: List[FFIBItem] = []
     seen = set()
-    for
+    for it in items:
+        key = (it.match_date, it.is_postponed, it.is_admin_3_0, tuple(sorted(it.acta_links)))
+        if key in seen:
+            continue
+        seen.add(key)
+        # Keep even if no links, because we want to count postponed/admin cases for reporting
+        uniq.append(it)
+
+    return uniq
+
+
+def try_download_pdf(url: str) -> Tuple[Optional[bytes], Optional[str]]:
+    """
+    Returns (bytes, content_type) if it looks like a PDF.
+    """
+    r = SESSION.get(url, timeout=60, allow_redirects=True)
+    if r.status_code >= 400:
+        return None, None
+    ctype = (r.headers.get("content-type") or "").lower()
+    if "application/pdf" in ctype or r.content[:4] == b"%PDF":
+        return r.content, ctype
+    # Sometimes it returns HTML that contains an embedded pdf link; try to find it
+    if "text/html" in ctype:
+        soup = BeautifulSoup(r.text, "lxml")
+        # find direct .pdf link
+        a = soup.find("a", href=re.compile(r"\.pdf", re.I))
+        if a and a.get("href"):
+            pdf_url = urljoin(url, a["href"])
+            r2 = SESSION.get(pdf_url, timeout=60, allow_redirects=True)
+            ctype2 = (r2.headers.get("content-type") or "").lower()
+            if "application/pdf" in ctype2 or r2.content[:4] == b"%PDF":
+                return r2.content, ctype2
+    return None, ctype
+
+
+def build_filename(naming: Naming, comp: str, group: str, jornada: str, match_date: str, pxx: int) -> str:
+    p = naming.pattern
+    # Replace known tokens
+    # We keep your “pattern” simple: user wants it exactly; we only fill pXX manually with p01 etc.
+    out = p
+    out = out.replace("Temporada", naming.temporada)
+    out = out.replace("Competicion", comp)
+    out = out.replace("Grupo", group)
+    out = out.replace("Jornada", jornada)
+    out = out.replace("fecha-jornada", match_date or "YYYY-MM-DD")
+
+    # pXX
+    out = out.replace("pXX", f"p{pxx:02d}")
+    # Ensure extension
+    if not out.lower().endswith(".pdf"):
+        out += ".pdf"
+    # Sanitize
+    out = re.sub(r"\s+", "_", out)
+    out = out.replace("__", "_")
+    return out
+
+
+# ---------------------------
+# API
+# ---------------------------
+
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+
+@app.post("/extract-download-upload", response_model=ExtractResponse)
+def extract_download_upload(req: ExtractRequest):
+    drive = None
+    try:
+        drive = _get_drive_client()
+    except Exception as e:
+        # We can still scrape, but uploads will fail.
+        drive = None
+        drive_err = str(e)
+    else:
+        drive_err = None
+
+    reports: List[LinkReport] = []
+
+    for link in req.urls:
+        comp = _extract_cod_from_url(link, "CodCompeticion") or "CompeticionXX"
+        group = _extract_cod_from_url(link, "CodGrupo") or "GrupoXX"
+        jornada = _extract_codjornada(link) or "JXX"
+
+        try:
+            items = ffib_parse_jornada(link)
+        except Exception as e:
+            reports.append(
+                LinkReport(
+                    url=link,
+                    status="failed",
+                    files=[],
+                    notes=f"Failed to load/parse FFIB page: {e}",
+                )
+            )
+            continue
+
+        file_results: List[FileResult] = []
+        zip_members: List[Tuple[str, bytes]] = []
+
+        p_counter = 0
+        green_found = 0
+        postponed = 0
+        admin = 0
+
+        # For each match item, process its green acta links
+        for it in items:
+            if it.is_postponed:
+                postponed += 1
+                continue
+            if it.is_admin_3_0:
+                admin += 1
+                continue
+
+            for acta_url in it.acta_links:
+                green_found += 1
+                p_counter += 1
+
+                match_date = it.match_date or "YYYY-MM-DD"
+                final_name = build_filename(req.naming, comp, group, f"J{jornada}" if not str(jornada).startswith("J") else jornada, match_date, p_counter)
+
+                pdf_bytes, ctype = try_download_pdf(acta_url)
+                if not pdf_bytes:
+                    file_results.append(
+                        FileResult(
+                            final_name=final_name,
+                            status="failed",
+                            reason=f"Could not download PDF from acta link (content-type={ctype})",
+                            source_url=acta_url,
+                        )
+                    )
+                    continue
+
+                if drive is None:
+                    file_results.append(
+                        FileResult(
+                            final_name=final_name,
+                            status="failed",
+                            reason=f"Drive client not available: {drive_err}",
+                            source_url=acta_url,
+                        )
+                    )
+                    continue
+
+                try:
+                    drive_link = drive_upload_bytes(
+                        drive,
+                        folder_id=req.drive_folder_id,
+                        filename=final_name,
+                        content_bytes=pdf_bytes,
+                        mimetype="application/pdf",
+                    )
+                    file_results.append(
+                        FileResult(
+                            final_name=final_name,
+                            status="ok",
+                            reason=None,
+                            source_url=acta_url,
+                            drive_link=drive_link,
+                        )
+                    )
+                    zip_members.append((final_name, pdf_bytes))
+                except Exception as e:
+                    file_results.append(
+                        FileResult(
+                            final_name=final_name,
+                            status="failed",
+                            reason=f"Drive upload failed: {e}",
+                            source_url=acta_url,
+                        )
+                    )
+
+        # ZIP if requested and we have at least 1 ok file
+        zip_link = None
+        if req.create_zip and drive is not None and zip_members:
+            zip_name = f"{req.naming.temporada}_{comp}_{group}_J{jornada}_actas.zip"
+            zbuf = io.BytesIO()
+            with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for fname, bts in zip_members:
+                    zf.writestr(fname, bts)
+            zbuf.seek(0)
+            try:
+                zip_link = drive_upload_bytes(
+                    drive,
+                    folder_id=req.drive_folder_id,
+                    filename=zip_name,
+                    content_bytes=zbuf.read(),
+                    mimetype="application/zip",
+                )
+            except Exception as e:
+                # Keep partial success
+                zip_link = None
+                file_results.append(
+                    FileResult(
+                        final_name=zip_name,
+                        status="failed",
+                        reason=f"ZIP upload failed: {e}",
+                        source_url=None,
+                    )
+                )
+
+        # Determine status
+        ok_count = sum(1 for f in file_results if f.status == "ok")
+        failed_count = sum(1 for f in file_results if f.status == "failed")
+
+        if ok_count > 0 and failed_count == 0:
+            status = "ok"
+        elif ok_count > 0 and failed_count > 0:
+            status = "partial"
+        else:
+            status = "failed"
+
+        notes = (
+            f"FFIB parsed. Green acta links found: {green_found}. "
+            f"Postponed blocks skipped: {postponed}. "
+            f"Admin/retirada blocks skipped: {admin}. "
+            "Rule: only green icons => download."
+        )
+        if drive_err:
+            notes += f" Drive not ready: {drive_err}"
+
+        reports.append(
+            LinkReport(
+                url=link,
+                status=status,
+                files=file_results,
+                zip_drive_link=zip_link,
+                notes=notes,
+            )
+        )
+
+    overall = "ok" if all(r.status == "ok" for r in reports) else ("partial" if any(r.status == "ok" for r in reports) else "failed")
+    return ExtractResponse(status=overall, reports=reports, notes="FFIB + Drive + ZIP pipeline executed.")
