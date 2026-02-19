@@ -17,6 +17,11 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 app = FastAPI(title="pdf-extractor-i", version="1.0.0")
+from fastapi.responses import PlainTextResponse
+
+@app.get("/privacy", response_class=PlainTextResponse)
+def privacy():
+    return "Privacy policy: This service processes user-provided public URLs to download PDFs and upload them to the user’s Google Drive folder. No data is sold or shared with third parties."
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
