@@ -187,75 +187,32 @@ def ffib_parse_jornada(url: str) -> List[FFIBItem]:
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
 
-    # FFIB pages vary. We'll treat each "match card" as a container that includes teams + score + date.
-    # Heuristic: look for blocks that contain a date like DD-MM-YYYY and team names.
-    items: List[FFIBItem] = []
-
-    # Find candidate containers: any element that contains a date pattern
-    date_nodes = soup.find_all(string=re.compile(r"\d{2}-\d{2}-\d{4}"))
-    seen_containers = set()
-
-    for dn in date_nodes:
-        container = dn.parent
-        # climb up a bit to capture whole match block
-        for _ in range(5):
-            if container is None:
-                break
-            container = container.parent
-        if not container:
-            continue
-
-        cid = id(container)
-        if cid in seen_containers:
-            continue
-        seen_containers.add(cid)
-
-        block_text = container.get_text(" ", strip=True)
-        match_date = _normalize_date(block_text)
-
-        is_postponed = _is_postponed_block(block_text)
-        is_admin = _is_admin_3_0(block_text)
-
-        # find links that could be acta/pdf inside container
-        # Often there are icons in <a> tags
-        acta_links = []
-        for a in container.find_all("a", href=True):
-            href = a["href"]
-            full = urljoin(url, href)
-
-            a_txt = (a.get_text(" ", strip=True) or "").lower()
-            title = (a.get("title") or "").lower()
-            aria = (a.get("aria-label") or "").lower()
-            blob = f"{a_txt} {title} {aria} {href}".lower()
-
-        # FFIB: si hay enlace a ficha partido con CodActa, es candidato a acta
+    # 1) Buscar TODOS los enlaces a ficha de partido con CodActa en toda la página
+    acta_links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
         if "NFG_CmpPartido" in href and ("CodActa=" in href or "cod_acta=" in href):
-        if not is_postponed and not is_admin:
-        acta_links.append(full)
+            acta_links.append(urljoin(url, href))
 
+    # Deduplicar
+    acta_links = sorted(set(acta_links))
 
-        # If we didn't find any green link in that container, skip it (no acta)
-        items.append(
-            FFIBItem(
-                match_date=match_date,
-                is_postponed=is_postponed,
-                is_admin_3_0=is_admin,
-                acta_links=acta_links,
-            )
+    # 2) Detectar aplazados / retirada de forma global (por texto de página)
+    page_text = soup.get_text(" ", strip=True).lower()
+    is_postponed = "aplazado" in page_text
+    is_admin = ("retirad" in page_text) or ("incomparec" in page_text) or ("3-0" in page_text and ("administr" in page_text or "admin" in page_text))
+
+    # 3) Devolver 1 item que contiene todos los CodActa encontrados.
+    #    La fecha real la sacaremos luego desde cada ficha de partido.
+    return [
+        FFIBItem(
+            match_date=None,
+            is_postponed=is_postponed,
+            is_admin_3_0=is_admin,
+            acta_links=acta_links,
         )
+    ]
 
-    # Deduplicate items by (date + links + flags)
-    uniq: List[FFIBItem] = []
-    seen = set()
-    for it in items:
-        key = (it.match_date, it.is_postponed, it.is_admin_3_0, tuple(sorted(it.acta_links)))
-        if key in seen:
-            continue
-        seen.add(key)
-        # Keep even if no links, because we want to count postponed/admin cases for reporting
-        uniq.append(it)
-
-    return uniq
 
 
 def try_download_pdf(url: str) -> Tuple[Optional[bytes], Optional[str]]:
