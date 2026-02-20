@@ -73,16 +73,32 @@ class ExtractResponse(BaseModel):
 # Google Drive helper
 # ---------------------------
 
+import json
+import binascii
+
 def _get_drive_client():
-    b64 = os.environ.get("GDRIVE_SA_JSON_B64", "").strip()
+    b64 = (os.environ.get("GDRIVE_SA_JSON_B64") or "").strip()
     if not b64:
         raise RuntimeError("Missing env var GDRIVE_SA_JSON_B64")
 
-    sa_json = base64.b64decode(b64).decode("utf-8")
+    # arregla padding si falta
+    b64 = b64.replace("\n", "").replace("\r", "").strip()
+    missing = len(b64) % 4
+    if missing:
+        b64 += "=" * (4 - missing)
+
+    try:
+        sa_json = base64.b64decode(b64).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError) as e:
+        raise RuntimeError(f"Invalid base64 in GDRIVE_SA_JSON_B64: {e}")
+
+    info = json.loads(sa_json)
     creds = service_account.Credentials.from_service_account_info(
-        eval(sa_json) if sa_json.strip().startswith("{") is False else __import__("json").loads(sa_json),
+        info,
         scopes=["https://www.googleapis.com/auth/drive"],
     )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
