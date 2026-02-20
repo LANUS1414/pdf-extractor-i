@@ -273,6 +273,26 @@ def try_download_pdf(url: str) -> Tuple[Optional[bytes], Optional[str]]:
         soup = BeautifulSoup(r.text, "lxml")
         # find direct .pdf link
         a = soup.find("a", href=re.compile(r"\.pdf", re.I))
+                # buscar botón/enlace "Generar PDF"
+        btn = soup.find("a", string=re.compile(r"Generar\s*PDF", re.I))
+        if btn and btn.get("href"):
+            pdf_url = urljoin(url, btn["href"])
+            r2 = SESSION.get(pdf_url, timeout=60, allow_redirects=True)
+            ctype2 = (r2.headers.get("content-type") or "").lower()
+            if "application/pdf" in ctype2 or r2.content[:4] == b"%PDF":
+                return r2.content, ctype2
+
+        # fallback: algunas veces es un onclick con URL
+        for el in soup.find_all(["a", "button"]):
+            onclick = (el.get("onclick") or "")
+            m = re.search(r"(NFG_[^\"']+\.pdf[^\"']*|NFG_[^\"']+CodActa=\d+[^\"']*)", onclick)
+            if m:
+                pdf_url = urljoin(url, m.group(1))
+                r2 = SESSION.get(pdf_url, timeout=60, allow_redirects=True)
+                ctype2 = (r2.headers.get("content-type") or "").lower()
+                if "application/pdf" in ctype2 or r2.content[:4] == b"%PDF":
+                    return r2.content, ctype2
+
         if a and a.get("href"):
             pdf_url = urljoin(url, a["href"])
             r2 = SESSION.get(pdf_url, timeout=60, allow_redirects=True)
