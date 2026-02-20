@@ -228,19 +228,11 @@ def ffib_parse_jornada(url: str) -> List[FFIBItem]:
             aria = (a.get("aria-label") or "").lower()
             blob = f"{a_txt} {title} {aria} {href}".lower()
 
-            # Candidate if mentions acta/pdf or looks like pdf endpoint
-            if ".pdf" in blob or "acta" in blob or "pdf" in blob:
-                # If FFIB uses a green icon, try to detect it by style/class on <a> or its children
-                is_green = _looks_green_icon(a)
-                if not is_green:
-                    # check children for green clues
-                    for ch in a.find_all(True):
-                        if _looks_green_icon(ch):
-                            is_green = True
-                            break
-                # Only include if green (acta elaborada) – your rule
-                if is_green and not is_postponed and not is_admin:
-                    acta_links.append(full)
+        # FFIB: si hay enlace a ficha partido con CodActa, es candidato a acta
+        if "NFG_CmpPartido" in href and ("CodActa=" in href or "cod_acta=" in href):
+        if not is_postponed and not is_admin:
+        acta_links.append(full)
+
 
         # If we didn't find any green link in that container, skip it (no acta)
         items.append(
